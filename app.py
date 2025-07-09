@@ -363,7 +363,7 @@ def get_mistral_ocr_result(file_id: str, mistral_key: str, language: str = "ben+
         st.error(f"❌ Error getting OCR result from Mistral: {str(e)}")
         return None
 
-def extract_text_with_mistral_ocr(image_file, language: str = "ben+eng") -> str:
+def extract_text_with_mistral_ocr(image_file, language: str = "ben+eng", progress_callback=None) -> str:
     """Extract text from image using Mistral OCR"""
     mistral_key = get_mistral_api_key_with_session()
     if not mistral_key:
@@ -371,6 +371,9 @@ def extract_text_with_mistral_ocr(image_file, language: str = "ben+eng") -> str:
         return ""
     
     try:
+        if progress_callback:
+            progress_callback(0.0, "🔍 Preparing image for OCR processing...")
+        
         if hasattr(image_file, 'getvalue'):
             file_data = image_file.getvalue()
             filename = image_file.name
@@ -378,23 +381,37 @@ def extract_text_with_mistral_ocr(image_file, language: str = "ben+eng") -> str:
             file_data = image_file
             filename = "uploaded_image.jpg"
         
-        st.info(f"📤 Uploading {filename} ({len(file_data)/1024:.1f} KB) to Mistral OCR...")
+        if progress_callback:
+            progress_callback(0.1, f"📤 Uploading {filename} ({len(file_data)/1024:.1f} KB) to Mistral...")
         
-        with st.spinner("📤 Uploading image to Mistral..."):
-            file_id = upload_file_to_mistral(file_data, filename, mistral_key)
+        # Step 1: Upload file to Mistral
+        file_id = upload_file_to_mistral(file_data, filename, mistral_key)
         
         if not file_id:
             st.error("❌ Failed to upload file to Mistral")
             return ""
         
-        st.success(f"✅ File uploaded successfully: {file_id}")
+        if progress_callback:
+            progress_callback(0.4, f"✅ File uploaded successfully: {file_id}")
         
-        with st.spinner("🔍 Processing OCR with Mistral..."):
-            time.sleep(3)
-            extracted_text = get_mistral_ocr_result(file_id, mistral_key, language)
+        # Step 2: Get OCR result
+        if progress_callback:
+            progress_callback(0.5, f"🔍 Processing OCR with Mistral (Language: {language})...")
+        
+        # Add delay for file processing
+        time.sleep(3)
+        
+        if progress_callback:
+            progress_callback(0.7, "⏳ Waiting for OCR processing to complete...")
+        
+        extracted_text = get_mistral_ocr_result(file_id, mistral_key, language)
+        
+        if progress_callback:
+            progress_callback(0.9, "📝 Processing extracted text...")
         
         if extracted_text:
-            st.success(f"✅ OCR completed! Extracted {len(extracted_text)} characters")
+            if progress_callback:
+                progress_callback(1.0, f"✅ OCR completed! Extracted {len(extracted_text)} characters")
             return safe_unicode_text(extracted_text)
         else:
             st.error("❌ Failed to extract text from image")
@@ -479,13 +496,19 @@ Return the response in this exact JSON format:
         else:
             raise ValueError(f"Unsupported file type: {file_extension}")
 
-    def process_with_openai(self, script_text: str) -> Dict[str, Any]:
+    def process_with_openai(self, script_text: str, progress_callback=None) -> Dict[str, Any]:
         """Process script text with OpenAI and return structured data"""
         try:
+            if progress_callback:
+                progress_callback(0.1, "🔤 Preparing script text for AI analysis...")
+            
             # Truncate text if too long
             max_chars = 100000
             if len(script_text) > max_chars:
                 script_text = script_text[:max_chars] + "\n[... truncated for processing ...]"
+            
+            if progress_callback:
+                progress_callback(0.2, f"📤 Sending {len(script_text):,} characters to OpenAI GPT-4...")
             
             response = self.client.chat.completions.create(
                 model="gpt-4",
@@ -497,7 +520,13 @@ Return the response in this exact JSON format:
                 max_tokens=4000
             )
             
+            if progress_callback:
+                progress_callback(0.7, "🤖 Received AI response, processing results...")
+            
             response_text = response.choices[0].message.content
+            
+            if progress_callback:
+                progress_callback(0.8, "📋 Parsing structured data from AI response...")
             
             # Try to parse JSON from response
             try:
@@ -512,6 +541,10 @@ Return the response in this exact JSON format:
                 
                 json_str = response_text[start_idx:end_idx]
                 parsed_data = json.loads(json_str)
+                
+                if progress_callback:
+                    progress_callback(0.9, "✅ Successfully parsed production breakdown data...")
+                
                 return parsed_data
                 
             except json.JSONDecodeError as e:
@@ -523,10 +556,16 @@ Return the response in this exact JSON format:
         except Exception as e:
             raise Exception(f"OpenAI processing error: {str(e)}")
 
-    def process_script_file(self, file_data: bytes, filename: str) -> Dict[str, Any]:
+    def process_script_file(self, file_data: bytes, filename: str, progress_callback=None) -> Dict[str, Any]:
         """Main processing function - extract text and analyze with OpenAI"""
         try:
+            if progress_callback:
+                progress_callback(0.0, f"📄 Starting processing of {filename}...")
+            
             # Extract text from file
+            if progress_callback:
+                progress_callback(0.1, f"🔍 Extracting text from {filename}...")
+            
             script_text = self.extract_text_from_file(file_data, filename)
             
             if not script_text.strip():
@@ -535,8 +574,17 @@ Return the response in this exact JSON format:
                     "filename": filename
                 }
             
+            if progress_callback:
+                progress_callback(0.2, f"✅ Extracted {len(script_text):,} characters from {filename}")
+            
             # Process with OpenAI
-            result = self.process_with_openai(script_text)
+            if progress_callback:
+                progress_callback(0.3, "🤖 Starting AI analysis...")
+            
+            result = self.process_with_openai(script_text, progress_callback)
+            
+            if progress_callback:
+                progress_callback(0.95, "📊 Finalizing results and adding metadata...")
             
             # Add metadata
             if 'error' not in result:
@@ -546,6 +594,9 @@ Return the response in this exact JSON format:
                     'text_length': len(script_text),
                     'processed_at': time.strftime('%Y-%m-%d %H:%M:%S')
                 }
+            
+            if progress_callback:
+                progress_callback(1.0, "🎉 Processing complete!")
             
             return result
             
@@ -816,7 +867,15 @@ def create_mistral_ocr_tab():
                     st.warning(f"Could not display image preview: {e}")
             
             if st.button("🔍 Extract Text with Mistral OCR", type="primary"):
-                extracted_text = extract_text_with_mistral_ocr(uploaded_image, language_code)
+                # Create progress bar for OCR
+                progress_bar = st.progress(0)
+                status_text = st.empty()
+                
+                def update_progress(value, message):
+                    progress_bar.progress(value)
+                    status_text.text(message)
+                
+                extracted_text = extract_text_with_mistral_ocr(uploaded_image, language_code, update_progress)
                 
                 if extracted_text.strip():
                     st.success(f"✅ Extracted {len(extracted_text):,} characters")
@@ -837,22 +896,44 @@ def create_mistral_ocr_tab():
                     # Create fake file data for processing
                     fake_file_data = extracted_text.encode('utf-8')
                     
-                    with st.spinner("Processing script with AI..."):
-                        results = processor.process_script_file(fake_file_data, "OCR_Extracted_Script.txt")
+                    # Create progress bar for script processing
+                    processing_progress = st.progress(0)
+                    processing_status = st.empty()
+                    
+                    def update_processing_progress(value, message):
+                        processing_progress.progress(value)
+                        processing_status.text(message)
+                    
+                    results = processor.process_script_file(fake_file_data, "OCR_Extracted_Script.txt", update_processing_progress)
                     
                     if 'error' in results:
                         st.error(f"❌ Processing error: {results['error']}")
                     else:
+                        st.success("🎉 Script processing complete!")
                         display_results(results, "OCR_Extracted_Script")
                 
                 else:
                     st.error("❌ No text could be extracted from the image")
     else:
         st.error(f"❌ Mistral OCR not available: {mistral_message}")
+        
+        # Show setup instructions
+        with st.expander("🔧 Setup Instructions"):
+            st.markdown("""
+            **To enable Mistral OCR:**
+            1. ✅ Configure your Mistral API key above
+            2. ✅ Ensure OCR access in your Mistral subscription  
+            3. ✅ Test the connection
+            """)
 
 def display_results(results: Dict[str, Any], filename: str):
     """Display processing results with charts and download options"""
     st.header("📊 Production Breakdown Results")
+    
+    # Processing completion message
+    if 'metadata' in results:
+        processing_time = results['metadata'].get('processed_at', 'Unknown')
+        st.success(f"✅ Processing completed at {processing_time}")
     
     # Summary metrics
     total_locations = len(results.get('location_breakdown', []))
@@ -904,24 +985,67 @@ def display_results(results: Dict[str, Any], filename: str):
     # Download reports
     st.subheader("📥 Download Reports")
     
-    # Generate Excel report
-    excel_data = generate_excel_report(results, filename)
-    if excel_data:
-        st.download_button(
-            label="📊 Download Excel Report",
-            data=excel_data,
-            file_name=f"{filename}_production_breakdown.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        )
-    
-    # JSON download
-    json_data = json.dumps(results, indent=2)
-    st.download_button(
-        label="📄 Download JSON Data",
-        data=json_data,
-        file_name=f"{filename}_breakdown.json",
-        mime="application/json"
-    )
+    # Show report generation progress
+    if st.button("🔄 Generate Reports", type="secondary"):
+        report_progress = st.progress(0)
+        report_status = st.empty()
+        
+        report_status.text("📊 Generating Excel report...")
+        report_progress.progress(0.3)
+        
+        excel_data = generate_excel_report(results, filename)
+        
+        report_status.text("📄 Preparing JSON export...")
+        report_progress.progress(0.6)
+        
+        json_data = json.dumps(results, indent=2)
+        
+        report_status.text("✅ Reports ready for download!")
+        report_progress.progress(1.0)
+        
+        time.sleep(1)  # Brief pause for user feedback
+        
+        # Download buttons
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            if excel_data:
+                st.download_button(
+                    label="📊 Download Excel Report",
+                    data=excel_data,
+                    file_name=f"{filename}_production_breakdown.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                )
+        
+        with col2:
+            st.download_button(
+                label="📄 Download JSON Data",
+                data=json_data,
+                file_name=f"{filename}_breakdown.json",
+                mime="application/json"
+            )
+    else:
+        # Show quick download buttons without progress
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            excel_data = generate_excel_report(results, filename)
+            if excel_data:
+                st.download_button(
+                    label="📊 Download Excel Report",
+                    data=excel_data,
+                    file_name=f"{filename}_production_breakdown.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                )
+        
+        with col2:
+            json_data = json.dumps(results, indent=2)
+            st.download_button(
+                label="📄 Download JSON Data",
+                data=json_data,
+                file_name=f"{filename}_breakdown.json",
+                mime="application/json"
+            )
 
 def main():
     """Main application function"""
@@ -1051,6 +1175,14 @@ def main():
         if uploaded_file is not None:
             st.success(f"✅ File uploaded: {uploaded_file.name}")
             
+            # Show file info
+            file_size = len(uploaded_file.getvalue())
+            col1, col2 = st.columns(2)
+            with col1:
+                st.metric("File Size", f"{file_size/1024:.1f} KB")
+            with col2:
+                st.metric("File Type", uploaded_file.name.split('.')[-1].upper())
+            
             openai_key = get_api_key()
             if not openai_key:
                 st.error("❌ OpenAI API key required for processing")
@@ -1059,8 +1191,19 @@ def main():
             if st.button("🔍 Process Script", type="primary"):
                 processor = FilmScriptProcessor(openai_key)
                 
-                with st.spinner("Processing script..."):
-                    results = processor.process_script_file(uploaded_file.getvalue(), uploaded_file.name)
+                # Create progress bar and status
+                progress_bar = st.progress(0)
+                status_text = st.empty()
+                
+                def update_progress(value, message):
+                    progress_bar.progress(value)
+                    status_text.text(message)
+                
+                # Show estimated time
+                estimated_time = max(30, file_size // 1024)  # Rough estimate
+                st.info(f"⏱️ Estimated processing time: {estimated_time} seconds")
+                
+                results = processor.process_script_file(uploaded_file.getvalue(), uploaded_file.name, update_progress)
                 
                 if 'error' in results:
                     st.error(f"❌ Processing error: {results['error']}")
@@ -1068,6 +1211,7 @@ def main():
                         with st.expander("Raw Response"):
                             st.text(results['raw_response'])
                 else:
+                    st.success("🎉 Script processing complete!")
                     display_results(results, uploaded_file.name)
     
     with tab2:
@@ -1080,25 +1224,48 @@ def main():
             placeholder="INT. OFFICE - DAY\n\nJOHN enters the office and sits at his desk.\n\nJOHN\nTime to get to work.\n\nHe opens his laptop and starts typing..."
         )
         
-        if script_text and st.button("🔍 Process Script", type="primary"):
-            openai_key = get_api_key()
-            if not openai_key:
-                st.error("❌ OpenAI API key required for processing")
-                return
+        if script_text:
+            # Show text info
+            word_count = len(script_text.split())
+            char_count = len(script_text)
             
-            processor = FilmScriptProcessor(openai_key)
+            col1, col2 = st.columns(2)
+            with col1:
+                st.metric("Character Count", f"{char_count:,}")
+            with col2:
+                st.metric("Word Count", f"{word_count:,}")
             
-            with st.spinner("Processing script..."):
+            if st.button("🔍 Process Script", type="primary"):
+                openai_key = get_api_key()
+                if not openai_key:
+                    st.error("❌ OpenAI API key required for processing")
+                    return
+                
+                processor = FilmScriptProcessor(openai_key)
+                
+                # Create progress bar and status
+                progress_bar = st.progress(0)
+                status_text = st.empty()
+                
+                def update_progress(value, message):
+                    progress_bar.progress(value)
+                    status_text.text(message)
+                
+                # Show estimated time
+                estimated_time = max(20, char_count // 5000)  # Rough estimate
+                st.info(f"⏱️ Estimated processing time: {estimated_time} seconds")
+                
                 fake_file_data = script_text.encode('utf-8')
-                results = processor.process_script_file(fake_file_data, "Pasted_Script.txt")
-            
-            if 'error' in results:
-                st.error(f"❌ Processing error: {results['error']}")
-                if 'raw_response' in results:
-                    with st.expander("Raw Response"):
-                        st.text(results['raw_response'])
-            else:
-                display_results(results, "Pasted_Script")
+                results = processor.process_script_file(fake_file_data, "Pasted_Script.txt", update_progress)
+                
+                if 'error' in results:
+                    st.error(f"❌ Processing error: {results['error']}")
+                    if 'raw_response' in results:
+                        with st.expander("Raw Response"):
+                            st.text(results['raw_response'])
+                else:
+                    st.success("🎉 Script processing complete!")
+                    display_results(results, "Pasted_Script")
     
     with tab3:
         create_mistral_ocr_tab()
