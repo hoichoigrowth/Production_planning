@@ -426,12 +426,12 @@ class FilmScriptProcessor:
     def __init__(self, openai_api_key: str):
         """Initialize the processor with OpenAI API key"""
         self.client = OpenAI(api_key=openai_api_key)
-        self.system_prompt = """You are a senior film production coordinator with extensive experience in script breakdowns for pre-production. Your job is to read a screenplay and extract **clear, structured production elements** including locations, scenes, and props."""
+        self.system_prompt = """You are a senior film production coordinator with extensive experience in script breakdowns for pre-production. Your job is to read screenplay chunks and extract **clear, structured production elements** including locations, scenes, and props."""
         
-        self.user_prompt = """You will now be given a full script. Based on it, extract the following elements in a **structured JSON format**:
+        self.user_prompt = """You will now be given a screenplay chunk. Based on it, extract the following elements in a **structured JSON format**:
 
 1. **Location-Based Scene Breakdown**
-For each LOCATION, group all scenes that occur there:
+For each LOCATION found in this chunk, group all scenes that occur there:
    * `location_name` (primary key - e.g., "Office", "Restaurant", "Car")
    * `scenes_in_location` (array of scenes at this location):
      - `scene_number` (if available or infer from order)
@@ -441,7 +441,7 @@ For each LOCATION, group all scenes that occur there:
      - `props_in_scene` (all physical props mentioned explicitly)
 
 2. **Unique Props List**
-At the end, give a consolidated list of all **unique props** used across all scenes.
+At the end, give a consolidated list of all **unique props** used across all scenes in this chunk.
 
 Return the response in this exact JSON format:
 {
@@ -460,7 +460,9 @@ Return the response in this exact JSON format:
     }
   ],
   "unique_props": ["desk", "chair", "computer"]
-}"""
+}
+
+IMPORTANT: Only process the content in this specific chunk. Don't make assumptions about other parts of the script."""
 
     def extract_text_from_pdf(self, file_data: bytes) -> str:
         """Extract text from PDF bytes"""
@@ -496,65 +498,241 @@ Return the response in this exact JSON format:
         else:
             raise ValueError(f"Unsupported file type: {file_extension}")
 
-    def process_with_openai(self, script_text: str, progress_callback=None) -> Dict[str, Any]:
-        """Process script text with OpenAI and return structured data"""
+    def estimate_tokens(self, text: str) -> int:
+        """Estimate token count (rough approximation: 1 token ≈ 4 characters)"""
+        return len(text) // 4
+    
+    def chunk_text_for_processing(self, text: str, max_tokens: int = 6000) -> List[str]:
+        """Split text into chunks that fit within token limits"""
+        # Account for system prompt and response tokens
+        available_tokens = max_tokens - 1500  # Reserve tokens for system prompt and response
+        max_chars = available_tokens * 4  # Rough conversion
+        
+        if len(text) <= max_chars:
+            return [text]
+        
+        chunks = []
+        lines = text.split('\n')
+        current_chunk = ""
+        
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            
+            # Check if adding this line would exceed the limit
+            if len(current_chunk + line + '\n') > max_chars and current_chunk:
+                chunks.append(current_chunk.strip())
+                current_chunk = line + '\n'
+            else:
+                current_chunk += line + '\n'
+        
+        # Add remaining chunk
+        if current_chunk.strip():
+            chunks.append(current_chunk.strip())
+        
+        return chunks
+    
+    def process_chunk_with_openai(self, chunk: str, chunk_num: int, total_chunks: int) -> Dict[str, Any]:
+        """Process a single chunk with OpenAI"""
         try:
-            if progress_callback:
-                progress_callback(0.1, "🔤 Preparing script text for AI analysis...")
-            
-            # Truncate text if too long
-            max_chars = 100000
-            if len(script_text) > max_chars:
-                script_text = script_text[:max_chars] + "\n[... truncated for processing ...]"
-            
-            if progress_callback:
-                progress_callback(0.2, f"📤 Sending {len(script_text):,} characters to OpenAI GPT-4...")
+            # Simplified prompt for chunked processing
+            chunk_prompt = f"""You are analyzing a screenplay chunk ({chunk_num}/{total_chunks}). Extract locations, scenes, and props from this chunk only.
+
+Return ONLY valid JSON in this format:
+{{
+  "locations": [
+    {{
+      "location_name": "Location Name",
+      "scenes": [
+        {{
+          "scene_number": "Scene number or sequence",
+          "scene_heading": "Scene heading",
+          "time_of_day": "DAY/NIGHT/DAWN/DUSK",
+          "description": "Brief scene description",
+          "props": ["prop1", "prop2"]
+        }}
+      ]
+    }}
+  ]
+}}
+
+Chunk content:
+{chunk}"""
             
             response = self.client.chat.completions.create(
                 model="gpt-4",
                 messages=[
-                    {"role": "system", "content": self.system_prompt},
-                    {"role": "user", "content": f"{self.user_prompt}\n\nScript content:\n{script_text}"}
+                    {"role": "system", "content": "You are a film production assistant. Extract locations, scenes, and props from screenplay chunks. Return only valid JSON."},
+                    {"role": "user", "content": chunk_prompt}
                 ],
                 temperature=0.1,
-                max_tokens=4000
+                max_tokens=1500
             )
-            
-            if progress_callback:
-                progress_callback(0.7, "🤖 Received AI response, processing results...")
             
             response_text = response.choices[0].message.content
             
-            if progress_callback:
-                progress_callback(0.8, "📋 Parsing structured data from AI response...")
-            
-            # Try to parse JSON from response
+            # Parse JSON response
             try:
                 start_idx = response_text.find('{')
                 end_idx = response_text.rfind('}') + 1
                 
                 if start_idx == -1 or end_idx == 0:
-                    return {
-                        "error": "No JSON found in OpenAI response",
-                        "raw_response": response_text
-                    }
+                    return {"error": f"No JSON found in chunk {chunk_num} response"}
                 
                 json_str = response_text[start_idx:end_idx]
                 parsed_data = json.loads(json_str)
-                
-                if progress_callback:
-                    progress_callback(0.9, "✅ Successfully parsed production breakdown data...")
-                
                 return parsed_data
                 
             except json.JSONDecodeError as e:
-                return {
-                    "error": f"Could not parse JSON response: {str(e)}",
-                    "raw_response": response_text
-                }
+                return {"error": f"JSON parsing error in chunk {chunk_num}: {str(e)}"}
                 
         except Exception as e:
-            raise Exception(f"OpenAI processing error: {str(e)}")
+            return {"error": f"OpenAI error processing chunk {chunk_num}: {str(e)}"}
+    
+    def merge_chunk_results(self, chunk_results: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Merge results from multiple chunks into final format"""
+        merged_locations = {}
+        all_props = set()
+        
+        for chunk_result in chunk_results:
+            if 'error' in chunk_result:
+                continue
+                
+            locations = chunk_result.get('locations', [])
+            for location in locations:
+                location_name = location.get('location_name', 'Unknown')
+                scenes = location.get('scenes', [])
+                
+                if location_name not in merged_locations:
+                    merged_locations[location_name] = {
+                        'location_name': location_name,
+                        'scenes_in_location': []
+                    }
+                
+                for scene in scenes:
+                    # Add scene to location
+                    scene_data = {
+                        'scene_number': scene.get('scene_number', 'N/A'),
+                        'scene_heading': scene.get('scene_heading', 'N/A'),
+                        'time_of_day': scene.get('time_of_day', 'N/A'),
+                        'brief_description': scene.get('description', 'N/A'),
+                        'props_in_scene': scene.get('props', [])
+                    }
+                    merged_locations[location_name]['scenes_in_location'].append(scene_data)
+                    
+                    # Collect all props
+                    all_props.update(scene.get('props', []))
+        
+        # Convert to final format
+        final_result = {
+            'location_breakdown': list(merged_locations.values()),
+            'unique_props': sorted(list(all_props))
+        }
+        
+        return final_result
+    def process_with_openai(self, script_text: str, progress_callback=None) -> Dict[str, Any]:
+        """Process script text with OpenAI using chunking for large texts"""
+        try:
+            if progress_callback:
+                progress_callback(0.1, "🔤 Analyzing script length and preparing for processing...")
+            
+            # Estimate tokens
+            estimated_tokens = self.estimate_tokens(script_text)
+            
+            if progress_callback:
+                progress_callback(0.15, f"📊 Estimated tokens: {estimated_tokens:,}")
+            
+            # Check if we need to chunk the text
+            if estimated_tokens > 6000:  # Safe limit for GPT-4
+                if progress_callback:
+                    progress_callback(0.2, f"📄 Text is large ({estimated_tokens:,} tokens), splitting into chunks...")
+                
+                chunks = self.chunk_text_for_processing(script_text)
+                
+                if progress_callback:
+                    progress_callback(0.25, f"📋 Created {len(chunks)} chunks for processing...")
+                
+                # Process each chunk
+                chunk_results = []
+                for i, chunk in enumerate(chunks):
+                    if progress_callback:
+                        progress = 0.3 + (0.6 * (i + 1) / len(chunks))
+                        progress_callback(progress, f"🤖 Processing chunk {i+1}/{len(chunks)} with OpenAI...")
+                    
+                    chunk_result = self.process_chunk_with_openai(chunk, i+1, len(chunks))
+                    chunk_results.append(chunk_result)
+                    
+                    # Small delay to avoid rate limiting
+                    time.sleep(0.5)
+                
+                if progress_callback:
+                    progress_callback(0.9, "🔄 Merging results from all chunks...")
+                
+                # Merge chunk results
+                final_result = self.merge_chunk_results(chunk_results)
+                
+                if progress_callback:
+                    progress_callback(0.95, "✅ Successfully processed all chunks!")
+                
+                return final_result
+            
+            else:
+                # Process as single chunk (original logic)
+                if progress_callback:
+                    progress_callback(0.2, f"📤 Sending {len(script_text):,} characters to OpenAI GPT-4...")
+                
+                response = self.client.chat.completions.create(
+                    model="gpt-4",
+                    messages=[
+                        {"role": "system", "content": self.system_prompt},
+                        {"role": "user", "content": f"{self.user_prompt}\n\nScript content:\n{script_text}"}
+                    ],
+                    temperature=0.1,
+                    max_tokens=4000
+                )
+                
+                if progress_callback:
+                    progress_callback(0.7, "🤖 Received AI response, processing results...")
+                
+                response_text = response.choices[0].message.content
+                
+                if progress_callback:
+                    progress_callback(0.8, "📋 Parsing structured data from AI response...")
+                
+                # Try to parse JSON from response
+                try:
+                    start_idx = response_text.find('{')
+                    end_idx = response_text.rfind('}') + 1
+                    
+                    if start_idx == -1 or end_idx == 0:
+                        return {
+                            "error": "No JSON found in OpenAI response",
+                            "raw_response": response_text
+                        }
+                    
+                    json_str = response_text[start_idx:end_idx]
+                    parsed_data = json.loads(json_str)
+                    
+                    if progress_callback:
+                        progress_callback(0.9, "✅ Successfully parsed production breakdown data...")
+                    
+                    return parsed_data
+                    
+                except json.JSONDecodeError as e:
+                    return {
+                        "error": f"Could not parse JSON response: {str(e)}",
+                        "raw_response": response_text
+                    }
+                
+        except Exception as e:
+            if "context_length_exceeded" in str(e):
+                return {
+                    "error": f"Script too long for processing. Estimated {self.estimate_tokens(script_text):,} tokens. Please try a shorter script or contact support.",
+                    "raw_response": str(e)
+                }
+            else:
+                raise Exception(f"OpenAI processing error: {str(e)}")
 
     def process_script_file(self, file_data: bytes, filename: str, progress_callback=None) -> Dict[str, Any]:
         """Main processing function - extract text and analyze with OpenAI"""
@@ -1199,20 +1377,38 @@ def main():
                     progress_bar.progress(value)
                     status_text.text(message)
                 
-                # Show estimated time
-                estimated_time = max(30, file_size // 1024)  # Rough estimate
+                # Show file info and estimated time
+                file_size = len(uploaded_file.getvalue())
+                estimated_tokens = file_size // 4  # Rough estimate
+                
+                if estimated_tokens > 6000:
+                    st.warning(f"⚠️ Large script detected ({estimated_tokens:,} estimated tokens). Will process in chunks.")
+                    estimated_time = max(60, estimated_tokens // 100)  # Longer for chunked processing
+                else:
+                    estimated_time = max(30, file_size // 1024)
+                
                 st.info(f"⏱️ Estimated processing time: {estimated_time} seconds")
                 
-                results = processor.process_script_file(uploaded_file.getvalue(), uploaded_file.name, update_progress)
+                try:
+                    results = processor.process_script_file(uploaded_file.getvalue(), uploaded_file.name, update_progress)
+                    
+                    if 'error' in results:
+                        st.error(f"❌ Processing error: {results['error']}")
+                        if 'raw_response' in results:
+                            with st.expander("Raw Response"):
+                                st.text(results['raw_response'])
+                    else:
+                        st.success("🎉 Script processing complete!")
+                        display_results(results, uploaded_file.name)
+                        
+                except Exception as e:
+                    st.error(f"❌ Unexpected error: {str(e)}")
+                    st.info("💡 If the script is very long, try splitting it into smaller sections.")
                 
-                if 'error' in results:
-                    st.error(f"❌ Processing error: {results['error']}")
-                    if 'raw_response' in results:
-                        with st.expander("Raw Response"):
-                            st.text(results['raw_response'])
-                else:
-                    st.success("🎉 Script processing complete!")
-                    display_results(results, uploaded_file.name)
+                finally:
+                    # Clean up progress indicators
+                    progress_bar.empty()
+                    status_text.empty()
     
     with tab2:
         st.header("📝 Paste Script Text")
@@ -1251,21 +1447,38 @@ def main():
                     progress_bar.progress(value)
                     status_text.text(message)
                 
-                # Show estimated time
-                estimated_time = max(20, char_count // 5000)  # Rough estimate
+                # Show text info and estimated time
+                estimated_tokens = char_count // 4  # Rough estimate
+                
+                if estimated_tokens > 6000:
+                    st.warning(f"⚠️ Large script detected ({estimated_tokens:,} estimated tokens). Will process in chunks.")
+                    estimated_time = max(60, estimated_tokens // 100)  # Longer for chunked processing
+                else:
+                    estimated_time = max(20, char_count // 5000)
+                
                 st.info(f"⏱️ Estimated processing time: {estimated_time} seconds")
                 
-                fake_file_data = script_text.encode('utf-8')
-                results = processor.process_script_file(fake_file_data, "Pasted_Script.txt", update_progress)
+                try:
+                    fake_file_data = script_text.encode('utf-8')
+                    results = processor.process_script_file(fake_file_data, "Pasted_Script.txt", update_progress)
+                    
+                    if 'error' in results:
+                        st.error(f"❌ Processing error: {results['error']}")
+                        if 'raw_response' in results:
+                            with st.expander("Raw Response"):
+                                st.text(results['raw_response'])
+                    else:
+                        st.success("🎉 Script processing complete!")
+                        display_results(results, "Pasted_Script")
+                        
+                except Exception as e:
+                    st.error(f"❌ Unexpected error: {str(e)}")
+                    st.info("💡 If the script is very long, try splitting it into smaller sections.")
                 
-                if 'error' in results:
-                    st.error(f"❌ Processing error: {results['error']}")
-                    if 'raw_response' in results:
-                        with st.expander("Raw Response"):
-                            st.text(results['raw_response'])
-                else:
-                    st.success("🎉 Script processing complete!")
-                    display_results(results, "Pasted_Script")
+                finally:
+                    # Clean up progress indicators
+                    progress_bar.empty()
+                    status_text.empty()
     
     with tab3:
         create_mistral_ocr_tab()
