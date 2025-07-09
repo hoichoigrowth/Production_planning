@@ -536,73 +536,146 @@ IMPORTANT: Only process the content in this specific chunk. Don't make assumptio
     def process_chunk_with_openai(self, chunk: str, chunk_num: int, total_chunks: int) -> Dict[str, Any]:
         """Process a single chunk with OpenAI"""
         try:
-            # Simplified prompt for chunked processing
-            chunk_prompt = f"""You are analyzing a screenplay chunk ({chunk_num}/{total_chunks}). Extract locations, scenes, and props from this chunk only.
+            # Simplified and more reliable prompt for chunked processing
+            chunk_prompt = f"""Analyze this screenplay chunk and extract locations, scenes, and props. Return ONLY a JSON object with no additional text.
 
-Return ONLY valid JSON in this format:
+Chunk {chunk_num} of {total_chunks}:
+
+{chunk}
+
+Return exactly this JSON structure (no markdown, no explanations):
 {{
   "locations": [
     {{
       "location_name": "Location Name",
       "scenes": [
         {{
-          "scene_number": "Scene number or sequence",
-          "scene_heading": "Scene heading",
-          "time_of_day": "DAY/NIGHT/DAWN/DUSK",
-          "description": "Brief scene description",
+          "scene_number": "1",
+          "scene_heading": "INT. LOCATION - DAY",
+          "time_of_day": "DAY",
+          "description": "What happens in this scene",
           "props": ["prop1", "prop2"]
         }}
       ]
     }}
   ]
-}}
-
-Chunk content:
-{chunk}"""
+}}"""
             
             response = self.client.chat.completions.create(
                 model="gpt-4",
                 messages=[
-                    {"role": "system", "content": "You are a film production assistant. Extract locations, scenes, and props from screenplay chunks. Return only valid JSON."},
+                    {"role": "system", "content": "You are a screenplay analyzer. Extract locations, scenes, and props from screenplay text. Return ONLY valid JSON with no markdown formatting or additional text."},
                     {"role": "user", "content": chunk_prompt}
                 ],
                 temperature=0.1,
                 max_tokens=1500
             )
             
-            response_text = response.choices[0].message.content
+            response_text = response.choices[0].message.content.strip()
             
-            # Parse JSON response
+            # Clean up the response - remove markdown formatting if present
+            if response_text.startswith("```json"):
+                response_text = response_text.replace("```json", "")
+            if response_text.endswith("```"):
+                response_text = response_text.replace("```", "")
+            
+            response_text = response_text.strip()
+            
+            # Multiple strategies to find JSON
+            json_data = None
+            
+            # Strategy 1: Try direct parsing
             try:
-                start_idx = response_text.find('{')
-                end_idx = response_text.rfind('}') + 1
-                
-                if start_idx == -1 or end_idx == 0:
-                    return {"error": f"No JSON found in chunk {chunk_num} response"}
-                
-                json_str = response_text[start_idx:end_idx]
-                parsed_data = json.loads(json_str)
-                return parsed_data
-                
-            except json.JSONDecodeError as e:
-                return {"error": f"JSON parsing error in chunk {chunk_num}: {str(e)}"}
+                json_data = json.loads(response_text)
+            except json.JSONDecodeError:
+                pass
+            
+            # Strategy 2: Find JSON boundaries
+            if not json_data:
+                try:
+                    start_idx = response_text.find('{')
+                    end_idx = response_text.rfind('}') + 1
+                    
+                    if start_idx != -1 and end_idx > start_idx:
+                        json_str = response_text[start_idx:end_idx]
+                        json_data = json.loads(json_str)
+                except json.JSONDecodeError:
+                    pass
+            
+            # Strategy 3: Look for specific patterns
+            if not json_data:
+                try:
+                    # Try to find JSON-like structures
+                    import re
+                    json_pattern = r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}'
+                    matches = re.findall(json_pattern, response_text, re.DOTALL)
+                    
+                    for match in matches:
+                        try:
+                            json_data = json.loads(match)
+                            break
+                        except json.JSONDecodeError:
+                            continue
+                except:
+                    pass
+            
+            if json_data:
+                return json_data
+            else:
+                # If no JSON found, create a minimal structure
+                return {
+                    "locations": [{
+                        "location_name": f"Chunk_{chunk_num}_Content",
+                        "scenes": [{
+                            "scene_number": f"Chunk_{chunk_num}",
+                            "scene_heading": f"CONTENT FROM CHUNK {chunk_num}",
+                            "time_of_day": "UNKNOWN",
+                            "description": f"Content from chunk {chunk_num} - manual review needed",
+                            "props": []
+                        }]
+                    }],
+                    "parsing_error": f"Could not parse JSON from chunk {chunk_num}",
+                    "raw_response": response_text[:500] + "..." if len(response_text) > 500 else response_text
+                }
                 
         except Exception as e:
-            return {"error": f"OpenAI error processing chunk {chunk_num}: {str(e)}"}
+            return {
+                "error": f"OpenAI error processing chunk {chunk_num}: {str(e)}",
+                "locations": [{
+                    "location_name": f"Error_Chunk_{chunk_num}",
+                    "scenes": [{
+                        "scene_number": f"Error_{chunk_num}",
+                        "scene_heading": f"ERROR IN CHUNK {chunk_num}",
+                        "time_of_day": "UNKNOWN",
+                        "description": f"Error processing chunk {chunk_num}: {str(e)}",
+                        "props": []
+                    }]
+                }]
+            }
     
     def merge_chunk_results(self, chunk_results: List[Dict[str, Any]]) -> Dict[str, Any]:
         """Merge results from multiple chunks into final format"""
         merged_locations = {}
         all_props = set()
+        processing_errors = []
         
-        for chunk_result in chunk_results:
+        for i, chunk_result in enumerate(chunk_results, 1):
             if 'error' in chunk_result:
+                processing_errors.append(f"Chunk {i}: {chunk_result['error']}")
                 continue
-                
+            
+            if 'parsing_error' in chunk_result:
+                processing_errors.append(f"Chunk {i}: {chunk_result['parsing_error']}")
+                # Still try to process the fallback structure
+            
             locations = chunk_result.get('locations', [])
             for location in locations:
                 location_name = location.get('location_name', 'Unknown')
                 scenes = location.get('scenes', [])
+                
+                # Skip error placeholder locations
+                if location_name.startswith('Error_Chunk_') or location_name.startswith('Chunk_') and '_Content' in location_name:
+                    continue
                 
                 if location_name not in merged_locations:
                     merged_locations[location_name] = {
@@ -611,6 +684,10 @@ Chunk content:
                     }
                 
                 for scene in scenes:
+                    # Skip error placeholder scenes
+                    if scene.get('scene_heading', '').startswith('ERROR IN CHUNK') or scene.get('scene_heading', '').startswith('CONTENT FROM CHUNK'):
+                        continue
+                    
                     # Add scene to location
                     scene_data = {
                         'scene_number': scene.get('scene_number', 'N/A'),
@@ -629,6 +706,20 @@ Chunk content:
             'location_breakdown': list(merged_locations.values()),
             'unique_props': sorted(list(all_props))
         }
+        
+        # Add processing summary
+        total_chunks = len(chunk_results)
+        successful_chunks = total_chunks - len(processing_errors)
+        
+        final_result['processing_summary'] = {
+            'total_chunks': total_chunks,
+            'successful_chunks': successful_chunks,
+            'failed_chunks': len(processing_errors),
+            'success_rate': f"{(successful_chunks/total_chunks*100):.1f}%" if total_chunks > 0 else "0%"
+        }
+        
+        if processing_errors:
+            final_result['processing_errors'] = processing_errors
         
         return final_result
     def process_with_openai(self, script_text: str, progress_callback=None) -> Dict[str, Any]:
@@ -678,15 +769,20 @@ Chunk content:
                 return final_result
             
             else:
-                # Process as single chunk (original logic)
+                # Process as single chunk (original logic with improved JSON handling)
                 if progress_callback:
                     progress_callback(0.2, f"📤 Sending {len(script_text):,} characters to OpenAI GPT-4...")
                 
                 response = self.client.chat.completions.create(
                     model="gpt-4",
                     messages=[
-                        {"role": "system", "content": self.system_prompt},
-                        {"role": "user", "content": f"{self.user_prompt}\n\nScript content:\n{script_text}"}
+                        {"role": "system", "content": "You are a screenplay analyzer. Extract locations, scenes, and props from screenplay text. Return ONLY valid JSON with no markdown formatting or additional text."},
+                        {"role": "user", "content": f"""{self.user_prompt}
+
+Script content:
+{script_text}
+
+Return exactly this JSON structure (no markdown, no explanations):"""}
                     ],
                     temperature=0.1,
                     max_tokens=4000
@@ -695,34 +791,59 @@ Chunk content:
                 if progress_callback:
                     progress_callback(0.7, "🤖 Received AI response, processing results...")
                 
-                response_text = response.choices[0].message.content
+                response_text = response.choices[0].message.content.strip()
                 
                 if progress_callback:
                     progress_callback(0.8, "📋 Parsing structured data from AI response...")
                 
-                # Try to parse JSON from response
+                # Enhanced JSON parsing with multiple strategies
+                json_data = None
+                
+                # Clean up markdown formatting
+                if response_text.startswith("```json"):
+                    response_text = response_text.replace("```json", "")
+                if response_text.endswith("```"):
+                    response_text = response_text.replace("```", "")
+                response_text = response_text.strip()
+                
+                # Strategy 1: Direct parsing
                 try:
-                    start_idx = response_text.find('{')
-                    end_idx = response_text.rfind('}') + 1
-                    
-                    if start_idx == -1 or end_idx == 0:
-                        return {
-                            "error": "No JSON found in OpenAI response",
-                            "raw_response": response_text
-                        }
-                    
-                    json_str = response_text[start_idx:end_idx]
-                    parsed_data = json.loads(json_str)
-                    
+                    json_data = json.loads(response_text)
+                except json.JSONDecodeError:
+                    pass
+                
+                # Strategy 2: Find JSON boundaries
+                if not json_data:
+                    try:
+                        start_idx = response_text.find('{')
+                        end_idx = response_text.rfind('}') + 1
+                        
+                        if start_idx != -1 and end_idx > start_idx:
+                            json_str = response_text[start_idx:end_idx]
+                            json_data = json.loads(json_str)
+                    except json.JSONDecodeError:
+                        pass
+                
+                # Strategy 3: Pattern matching
+                if not json_data:
+                    try:
+                        import re
+                        json_pattern = r'\{.*\}'
+                        match = re.search(json_pattern, response_text, re.DOTALL)
+                        if match:
+                            json_data = json.loads(match.group())
+                    except:
+                        pass
+                
+                if json_data:
                     if progress_callback:
                         progress_callback(0.9, "✅ Successfully parsed production breakdown data...")
-                    
-                    return parsed_data
-                    
-                except json.JSONDecodeError as e:
+                    return json_data
+                else:
                     return {
-                        "error": f"Could not parse JSON response: {str(e)}",
-                        "raw_response": response_text
+                        "error": "Could not parse JSON from OpenAI response",
+                        "raw_response": response_text,
+                        "debug_info": f"Response length: {len(response_text)}, First 500 chars: {response_text[:500]}"
                     }
                 
         except Exception as e:
@@ -1113,6 +1234,25 @@ def display_results(results: Dict[str, Any], filename: str):
         processing_time = results['metadata'].get('processed_at', 'Unknown')
         st.success(f"✅ Processing completed at {processing_time}")
     
+    # Show processing summary if available (for chunked processing)
+    if 'processing_summary' in results:
+        summary = results['processing_summary']
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            st.metric("Total Chunks", summary['total_chunks'])
+        with col2:
+            st.metric("Successful Chunks", summary['successful_chunks'])
+        with col3:
+            st.metric("Failed Chunks", summary['failed_chunks'])
+        with col4:
+            st.metric("Success Rate", summary['success_rate'])
+        
+        # Show errors if any
+        if 'processing_errors' in results:
+            with st.expander("⚠️ Processing Warnings"):
+                for error in results['processing_errors']:
+                    st.warning(error)
+    
     # Summary metrics
     total_locations = len(results.get('location_breakdown', []))
     total_scenes = sum(len(loc.get('scenes_in_location', [])) for loc in results.get('location_breakdown', []))
@@ -1125,6 +1265,23 @@ def display_results(results: Dict[str, Any], filename: str):
         st.metric("Total Scenes", total_scenes)
     with col3:
         st.metric("Total Props", total_props)
+    
+    # Show message if no content was extracted
+    if total_locations == 0 and total_scenes == 0:
+        st.warning("⚠️ No locations or scenes were extracted from the script. This might indicate:")
+        st.markdown("""
+        - The script format is not recognized
+        - The content doesn't contain standard screenplay elements
+        - The text might need manual formatting
+        - Try uploading a different format or checking the script structure
+        """)
+        
+        # Still show raw response for debugging
+        if 'raw_response' in results:
+            with st.expander("🔍 Debug Information"):
+                st.text_area("Raw AI Response", results['raw_response'], height=200)
+        
+        return
     
     # Charts
     st.subheader("📈 Production Analytics")
@@ -1159,6 +1316,8 @@ def display_results(results: Dict[str, Any], filename: str):
             'Index': range(1, len(results['unique_props']) + 1)
         })
         st.dataframe(props_df, use_container_width=True)
+    else:
+        st.info("No props were identified in the script.")
     
     # Download reports
     st.subheader("📥 Download Reports")
