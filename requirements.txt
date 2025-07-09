@@ -1,0 +1,60 @@
+# Core Streamlit and Web Framework
+streamlit>=1.28.0
+requests>=2.31.0
+
+# Data Processing and Analysis
+pandas>=2.0.0
+numpy>=1.24.0
+
+# Visualization
+plotly>=5.15.0
+
+# AI/ML APIs
+openai>=1.3.0
+
+# Document Processing
+python-docx>=0.8.11
+PyPDF2>=3.0.1
+pdfplumber>=0.9.0
+
+# Excel Processing
+openpyxl>=3.1.2
+
+# PDF Generation
+reportlab>=4.0.4
+
+# Image Processing (for OCR)
+Pillow>=10.0.0
+
+# Unicode and Text Processing
+unicodedata2>=15.0.0
+
+# Time and Date Utilities
+python-dateutil>=2.8.2
+
+# JSON Processing (built-in, but good to specify)
+# json - built-in Python module
+
+# File I/O and Path Handling
+pathlib>=1.0.1
+
+# Regular Expressions (built-in)
+# re - built-in Python module
+
+# System and OS utilities (built-in)
+# os - built-in Python module
+# time - built-in Python module
+# io - built-in Python module
+# hashlib - built-in Python module
+
+# Type Hints
+typing>=3.7.4
+
+# Optional but recommended for production
+python-dotenv>=1.0.0
+
+# Security (if needed for production deployment)
+cryptography>=41.0.0
+
+# Additional utilities
+validators>=0.20.0
