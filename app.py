@@ -10,6 +10,17 @@ import re
 import io
 import hashlib
 from typing import Dict, List, Any, Tuple, Optional
+from auth import authenticate_user, render_user_header
+from utils import (
+    safe_unicode_text,
+    check_mistral_ocr_availability,
+    extract_text_with_mistral_ocr,
+    get_api_key,
+    get_mistral_api_key,
+    get_mistral_api_key_with_session,
+    upload_file_to_mistral,
+    get_mistral_ocr_result,
+)
 
 # Import dependencies with error handling
 try:
@@ -73,10 +84,39 @@ MAX_CHARS_PER_CHUNK = 100000  # For OpenAI processing
 CHUNK_DELAY = 0.5
 MAX_RETRIES = 3
 
-# Global variables for OCR availability
-MISTRAL_OCR_AVAILABLE = False
-OCR_AVAILABLE = False
-OCR_ERROR_MESSAGE = ""
+# ── File upload validation ────────────────────────────────────────────────────
+
+MAX_FILE_SIZE_MB = 50
+ALLOWED_EXTENSIONS = {".pdf", ".docx", ".doc"}
+ALLOWED_MIME_TYPES = {
+    "application/pdf",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "application/msword",
+}
+
+
+def validate_uploaded_file(uploaded_file) -> tuple:
+    """
+    Validate an uploaded file before processing.
+    Returns (is_valid: bool, error_message: str).
+    """
+    if uploaded_file is None:
+        return False, "No file uploaded."
+
+    file_size_mb = len(uploaded_file.getvalue()) / (1024 * 1024)
+    if file_size_mb > MAX_FILE_SIZE_MB:
+        return False, f"File too large ({file_size_mb:.1f} MB). Max size is {MAX_FILE_SIZE_MB} MB."
+
+    ext = os.path.splitext(uploaded_file.name)[1].lower()
+    if ext not in ALLOWED_EXTENSIONS:
+        return False, f"Unsupported file type: {ext}. Allowed: {', '.join(sorted(ALLOWED_EXTENSIONS))}"
+
+    if hasattr(uploaded_file, "type") and uploaded_file.type:
+        if uploaded_file.type not in ALLOWED_MIME_TYPES:
+            return False, f"Invalid file type detected: {uploaded_file.type}"
+
+    return True, ""
+
 
 # Streamlit App Configuration
 st.set_page_config(
@@ -85,341 +125,6 @@ st.set_page_config(
     layout="wide"
 )
 
-# Authentication Functions
-def check_email_domain(email: str) -> bool:
-    """Check if email belongs to authorized domain"""
-    authorized_domains = ['@hoichoi.tv', '@gmail.com', '@example.com']  # Add your authorized domains
-    return any(email.lower().strip().endswith(domain) for domain in authorized_domains)
-
-def authenticate_user():
-    """Handle user authentication"""
-    if 'authenticated' not in st.session_state:
-        st.session_state.authenticated = False
-    
-    if not st.session_state.authenticated:
-        st.markdown("""
-        <style>
-        .login-header {
-            background: linear-gradient(90deg, #ff6b6b, #4ecdc4);
-            padding: 2rem;
-            border-radius: 15px;
-            color: white;
-            text-align: center;
-            margin-bottom: 2rem;
-            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
-        }
-        .login-container {
-            background: white;
-            padding: 2rem;
-            border-radius: 15px;
-            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
-            border: 1px solid #e0e0e0;
-        }
-        </style>
-        """, unsafe_allow_html=True)
-        
-        st.markdown("""
-        <div class="login-header">
-            <h1>🎬 Film Script Production Breakdown</h1>
-            <h3>Automated Location & Props Analysis Platform</h3>
-            <p>✅ Script Processing | 📊 Production Planning | 🔍 Mistral OCR</p>
-        </div>
-        """, unsafe_allow_html=True)
-        
-        with st.container():
-            col1, col2, col3 = st.columns([1, 2, 1])
-            with col2:
-                st.markdown('<div class="login-container">', unsafe_allow_html=True)
-                
-                st.subheader("🔐 Access Portal")
-                st.write("Please login with your authorized email address")
-                
-                email = st.text_input(
-                    "Email Address",
-                    placeholder="yourname@hoichoi.tv",
-                    help="Enter your authorized email address"
-                )
-                
-                password = st.text_input(
-                    "Password",
-                    type="password",
-                    help="Enter your password"
-                )
-                
-                if st.button("🚀 Login", type="primary", use_container_width=True):
-                    if email and password:
-                        if check_email_domain(email):
-                            if len(password) >= 6:
-                                st.session_state.authenticated = True
-                                st.session_state.user_email = email
-                                st.session_state.user_name = email.split('@')[0].replace('.', ' ').title()
-                                st.session_state.is_admin = email.lower() in ['admin@hoichoi.tv', 'admin@gmail.com']
-                                st.success("✅ Login successful! Redirecting...")
-                                time.sleep(1)
-                                st.rerun()
-                            else:
-                                st.error("❌ Password must be at least 6 characters long")
-                        else:
-                            st.error("❌ Access denied. Please use an authorized email address.")
-                    else:
-                        st.error("❌ Please enter both email and password")
-                
-                st.markdown('</div>', unsafe_allow_html=True)
-        
-        return False
-    
-    return True
-
-# Unicode text processing functions
-def safe_unicode_text(text):
-    """Safely handle Unicode text"""
-    if not text:
-        return ""
-    
-    try:
-        if isinstance(text, bytes):
-            text = text.decode('utf-8', errors='replace')
-        elif not isinstance(text, str):
-            text = str(text)
-        
-        # Remove problematic characters
-        text = text.replace('\u200b', '')  # Zero-width space
-        text = text.replace('\ufeff', '')  # BOM
-        text = text.replace('\u200c', '')  # Zero-width non-joiner
-        text = text.replace('\u200d', '')  # Zero-width joiner
-        
-        # Normalize Unicode
-        import unicodedata
-        text = unicodedata.normalize('NFC', text)
-        
-        return text
-    except Exception as e:
-        st.error(f"Unicode processing error: {e}")
-        return str(text)
-
-# API Key Management
-def get_api_key():
-    """Get OpenAI API key from Streamlit secrets or user input"""
-    try:
-        return st.secrets.get("OPENAI_API_KEY", None)
-    except:
-        return None
-
-def get_mistral_api_key():
-    """Get Mistral API key from Streamlit secrets or user input"""
-    try:
-        return st.secrets.get("MISTRAL_API_KEY", None)
-    except:
-        return None
-
-def get_mistral_api_key_with_session():
-    """Get Mistral API key with session state support"""
-    if hasattr(st.session_state, 'temp_mistral_key') and st.session_state.temp_mistral_key:
-        return st.session_state.temp_mistral_key
-    try:
-        return st.secrets.get("MISTRAL_API_KEY", None)
-    except:
-        return None
-
-# Mistral OCR Functions
-def check_mistral_ocr_availability():
-    """Check if Mistral OCR is available"""
-    global MISTRAL_OCR_AVAILABLE, OCR_AVAILABLE, OCR_ERROR_MESSAGE
-    
-    mistral_key = get_mistral_api_key_with_session()
-    if not mistral_key:
-        OCR_ERROR_MESSAGE = "❌ Mistral API key not configured"
-        MISTRAL_OCR_AVAILABLE = False
-        OCR_AVAILABLE = False
-        return False, "Mistral API key not configured"
-    
-    if not MISTRAL_AVAILABLE:
-        OCR_ERROR_MESSAGE = "❌ requests library not available"
-        MISTRAL_OCR_AVAILABLE = False
-        OCR_AVAILABLE = False
-        return False, "requests library not available"
-    
-    try:
-        headers = {
-            "Authorization": f"Bearer {mistral_key}"
-        }
-        
-        response = requests.get("https://api.mistral.ai/v1/models", headers=headers, timeout=10)
-        
-        if response.status_code == 200:
-            MISTRAL_OCR_AVAILABLE = True
-            OCR_AVAILABLE = True
-            OCR_ERROR_MESSAGE = ""
-            return True, "Mistral OCR available"
-        elif response.status_code == 401:
-            OCR_ERROR_MESSAGE = "❌ Invalid Mistral API key"
-            MISTRAL_OCR_AVAILABLE = False
-            OCR_AVAILABLE = False
-            return False, "Invalid Mistral API key"
-        elif response.status_code == 403:
-            OCR_ERROR_MESSAGE = "❌ OCR access not enabled for this Mistral account"
-            MISTRAL_OCR_AVAILABLE = False
-            OCR_AVAILABLE = False
-            return False, "OCR access not enabled for this account"
-        else:
-            OCR_ERROR_MESSAGE = f"❌ Mistral API error: {response.status_code}"
-            MISTRAL_OCR_AVAILABLE = False
-            OCR_AVAILABLE = False
-            return False, f"Mistral API error: {response.status_code}"
-            
-    except Exception as e:
-        OCR_ERROR_MESSAGE = f"❌ Mistral API connection failed: {str(e)}"
-        MISTRAL_OCR_AVAILABLE = False
-        OCR_AVAILABLE = False
-        return False, f"Mistral API connection failed: {str(e)}"
-
-def upload_file_to_mistral(file_data: bytes, filename: str, mistral_key: str) -> Optional[str]:
-    """Upload file to Mistral files endpoint"""
-    try:
-        url = "https://api.mistral.ai/v1/files"
-        
-        headers = {
-            "Authorization": f"Bearer {mistral_key}"
-        }
-        
-        files = {
-            "file": (filename, file_data, "image/jpeg" if filename.lower().endswith(('.jpg', '.jpeg')) else "image/png")
-        }
-        
-        data = {
-            "purpose": "batch"
-        }
-        
-        response = requests.post(url, headers=headers, files=files, data=data, timeout=60)
-        
-        if response.status_code == 200:
-            result = response.json()
-            file_id = result.get("id")
-            if file_id:
-                st.success(f"✅ File uploaded to Mistral: {file_id}")
-                return file_id
-            else:
-                st.error("❌ No file ID returned from Mistral")
-                return None
-        else:
-            st.error(f"❌ Failed to upload file to Mistral: {response.status_code} - {response.text}")
-            return None
-            
-    except Exception as e:
-        st.error(f"❌ Error uploading file to Mistral: {str(e)}")
-        return None
-
-def get_mistral_ocr_result(file_id: str, mistral_key: str, language: str = "ben+eng") -> Optional[str]:
-    """Get OCR result from Mistral OCR endpoint"""
-    try:
-        url = "https://api.mistral.ai/v1/ocr"
-        
-        headers = {
-            "Authorization": f"Bearer {mistral_key}",
-            "Content-Type": "application/json"
-        }
-        
-        payload = {
-            "model": "mistral-ocr-latest",
-            "document": {
-                "type": "document_url", 
-                "document_url": f"{{ ${file_id}.uri }}"
-            },
-            "languages": [language],
-            "output_format": "text"
-        }
-        
-        response = requests.post(url, headers=headers, json=payload, timeout=120)
-        
-        if response.status_code == 200:
-            result = response.json()
-            extracted_text = ""
-            
-            if "text" in result:
-                extracted_text = result["text"]
-            elif "content" in result:
-                extracted_text = result["content"]
-            elif "extracted_text" in result:
-                extracted_text = result["extracted_text"]
-            elif "result" in result:
-                extracted_text = str(result["result"])
-            else:
-                for key, value in result.items():
-                    if isinstance(value, str) and len(value) > 10:
-                        extracted_text = value
-                        break
-                
-                if not extracted_text:
-                    st.warning("⚠️ OCR completed but no text found in response")
-                    st.json(result)
-                    return ""
-            
-            return extracted_text
-        else:
-            st.error(f"❌ Mistral OCR failed: {response.status_code} - {response.text}")
-            return None
-            
-    except Exception as e:
-        st.error(f"❌ Error getting OCR result from Mistral: {str(e)}")
-        return None
-
-def extract_text_with_mistral_ocr(image_file, language: str = "ben+eng", progress_callback=None) -> str:
-    """Extract text from image using Mistral OCR"""
-    mistral_key = get_mistral_api_key_with_session()
-    if not mistral_key:
-        st.error("❌ Mistral API key not configured for OCR")
-        return ""
-    
-    try:
-        if progress_callback:
-            progress_callback(0.0, "🔍 Preparing image for OCR processing...")
-        
-        if hasattr(image_file, 'getvalue'):
-            file_data = image_file.getvalue()
-            filename = image_file.name
-        else:
-            file_data = image_file
-            filename = "uploaded_image.jpg"
-        
-        if progress_callback:
-            progress_callback(0.1, f"📤 Uploading {filename} ({len(file_data)/1024:.1f} KB) to Mistral...")
-        
-        # Step 1: Upload file to Mistral
-        file_id = upload_file_to_mistral(file_data, filename, mistral_key)
-        
-        if not file_id:
-            st.error("❌ Failed to upload file to Mistral")
-            return ""
-        
-        if progress_callback:
-            progress_callback(0.4, f"✅ File uploaded successfully: {file_id}")
-        
-        # Step 2: Get OCR result
-        if progress_callback:
-            progress_callback(0.5, f"🔍 Processing OCR with Mistral (Language: {language})...")
-        
-        # Add delay for file processing
-        time.sleep(3)
-        
-        if progress_callback:
-            progress_callback(0.7, "⏳ Waiting for OCR processing to complete...")
-        
-        extracted_text = get_mistral_ocr_result(file_id, mistral_key, language)
-        
-        if progress_callback:
-            progress_callback(0.9, "📝 Processing extracted text...")
-        
-        if extracted_text:
-            if progress_callback:
-                progress_callback(1.0, f"✅ OCR completed! Extracted {len(extracted_text)} characters")
-            return safe_unicode_text(extracted_text)
-        else:
-            st.error("❌ Failed to extract text from image")
-            return ""
-            
-    except Exception as e:
-        st.error(f"❌ Mistral OCR failed: {str(e)}")
-        return ""
 
 # Film Script Processing Classes
 class FilmScriptProcessor:
@@ -1174,8 +879,12 @@ def create_mistral_ocr_tab():
                     progress_bar.progress(value)
                     status_text.text(message)
                 
-                extracted_text = extract_text_with_mistral_ocr(uploaded_image, language_code, update_progress)
-                
+                try:
+                    extracted_text = extract_text_with_mistral_ocr(uploaded_image, language_code, update_progress)
+                except Exception as _ocr_err:
+                    st.error(f"❌ Mistral OCR failed: {_ocr_err}")
+                    extracted_text = ""
+
                 if extracted_text.strip():
                     st.success(f"✅ Extracted {len(extracted_text):,} characters")
                     
@@ -1388,8 +1097,15 @@ def main():
     """Main application function"""
     # Authentication check
     if not authenticate_user():
-        return
-    
+        st.stop()
+    render_user_header()
+
+    # Initialise OCR session state
+    if "ocr_available" not in st.session_state:
+        st.session_state.ocr_available = False
+    if "ocr_error_message" not in st.session_state:
+        st.session_state.ocr_error_message = ""
+
     # Custom CSS
     st.markdown("""
     <style>
@@ -1510,8 +1226,13 @@ def main():
         )
         
         if uploaded_file is not None:
+            is_valid, error_msg = validate_uploaded_file(uploaded_file)
+            if not is_valid:
+                st.error(error_msg)
+                st.stop()
+
             st.success(f"✅ File uploaded: {uploaded_file.name}")
-            
+
             # Show file info
             file_size = len(uploaded_file.getvalue())
             col1, col2 = st.columns(2)
